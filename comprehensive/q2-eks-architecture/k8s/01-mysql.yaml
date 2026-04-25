@@ -1,0 +1,171 @@
+# --------------------------------------------------
+# MySQL StatefulSet（讀寫分離）
+#
+# 架構圖中 sts(mysql) 產生 writer pod 與 reader pod
+# 使用 StatefulSet replicas=2：
+#   - mysql-0 作為 writer（primary）
+#   - mysql-1 作為 reader（replica）
+# 透過 initContainer 判斷 ordinal index 決定角色
+# --------------------------------------------------
+
+# StorageClass：使用 gp3 EBS，確保 IOPS 效能
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mysql-sc
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+# Headless Service：讓 StatefulSet 每個 pod 有穩定 DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: asiayo
+  labels:
+    app: mysql
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+---
+# 額外 Service：只導向 writer (mysql-0) 供應用寫入
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-writer
+  namespace: asiayo
+spec:
+  selector:
+    app: mysql
+    statefulset.kubernetes.io/pod-name: mysql-0
+  ports:
+    - port: 3306
+---
+# 額外 Service：只導向 reader (mysql-1) 供應用讀取
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-reader
+  namespace: asiayo
+spec:
+  selector:
+    app: mysql
+    statefulset.kubernetes.io/pod-name: mysql-1
+  ports:
+    - port: 3306
+---
+# MySQL 設定：writer 啟用 binlog，reader 設為 read-only
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: asiayo
+data:
+  writer.cnf: |
+    [mysqld]
+    server-id=1
+    log-bin=mysql-bin
+  reader.cnf: |
+    [mysqld]
+    server-id=2
+    super-read-only
+---
+# 密碼以 Secret 管理（正式環境建議搭配 AWS Secrets Manager）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: asiayo
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: "<changeme>"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: asiayo
+spec:
+  serviceName: mysql
+  replicas: 2 # mysql-0=writer, mysql-1=reader
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      # initContainer：依 pod ordinal 複製對應的 cnf
+      initContainers:
+        - name: init-mysql
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              # 取得 pod ordinal index
+              ordinal=$(echo $HOSTNAME | grep -o '[0-9]*$')
+              if [ "$ordinal" = "0" ]; then
+                cp /mnt/config/writer.cnf /mnt/conf.d/server.cnf
+              else
+                cp /mnt/config/reader.cnf /mnt/conf.d/server.cnf
+              fi
+          volumeMounts:
+            - name: config-map
+              mountPath: /mnt/config
+            - name: conf
+              mountPath: /mnt/conf.d
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: mysql-secret
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # 健康檢查確保 pod 真正可用
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: config-map
+          configMap:
+            name: mysql-config
+        - name: conf
+          emptyDir: {}
+  # 每個 pod 各自擁有獨立 PVC，資料不共享
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: mysql-sc
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

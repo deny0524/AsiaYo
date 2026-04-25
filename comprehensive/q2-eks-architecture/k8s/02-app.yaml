@@ -1,0 +1,150 @@
+# --------------------------------------------------
+# 應用服務層
+#
+# 架構圖流向：ing → svc → pod ← deploy ← pvc ← pv
+# 高可用設計：
+#   - replicas=3 搭配 podAntiAffinity 分散到不同節點
+#   - PDB 確保滾動更新時至少 2 個 pod 可用
+# --------------------------------------------------
+
+# PV + PVC：應用若需持久化儲存（如上傳檔案、快取等）
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: ebs.csi.aws.com
+    volumeHandle: <ebs-volume-id> # 替換為實際 EBS volume ID
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-pvc
+  namespace: asiayo
+spec:
+  storageClassName: gp2
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+# Deployment：應用程式主體
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asiayo-app
+  namespace: asiayo
+spec:
+  replicas: 3 # 高可用：至少 3 副本
+  selector:
+    matchLabels:
+      app: asiayo-app
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0 # 滾動更新時不減少可用 pod
+  template:
+    metadata:
+      labels:
+        app: asiayo-app
+    spec:
+      # 反親和性：將 pod 分散到不同節點，避免單節點故障影響全部
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: asiayo-app
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: app
+          image: <aws-account-id>.dkr.ecr.ap-northeast-1.amazonaws.com/asiayo-app:latest
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: app-storage
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: app-storage
+          persistentVolumeClaim:
+            claimName: app-pvc
+---
+# PodDisruptionBudget：確保任何時候至少 2 個 pod 存活
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: asiayo-app-pdb
+  namespace: asiayo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: asiayo-app
+---
+# Service：ClusterIP 供 Ingress 導流
+apiVersion: v1
+kind: Service
+metadata:
+  name: asiayo-app-svc
+  namespace: asiayo
+spec:
+  selector:
+    app: asiayo-app
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Ingress：對外入口，使用 AWS ALB Ingress Controller
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: asiayo-ingress
+  namespace: asiayo
+  annotations:
+    # 使用 AWS ALB 作為 Ingress Controller
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # 跨 AZ 負載均衡，提升可用性
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60
+spec:
+  rules:
+    - host: asiayo.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: asiayo-app-svc
+                port:
+                  number: 80

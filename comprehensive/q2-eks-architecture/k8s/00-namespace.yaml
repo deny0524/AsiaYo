@@ -1,0 +1,5 @@
+# 依架構圖，所有資源部署在 asiayo namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: asiayo
